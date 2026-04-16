@@ -241,6 +241,7 @@ class AuctionItem:
     status:          str = ""
     failure_count:   int = 0
     detail_url:      str = ""
+    status:          str = ""       # "경매전" = 미시작, "" = 일반
 
 
 class CourtAuctionScraper:
@@ -258,6 +259,71 @@ class CourtAuctionScraper:
         self.log         = log_fn or print
 
     # ────────────────────────────────────────────────────────────────
+    def search_by_case_numbers(
+        self,
+        case_numbers: list[str],
+        stat_num: str = "05",
+    ) -> list[AuctionItem]:
+        """
+        사건번호 목록으로 직접 검색 (경매 미시작 물건 포함).
+        case_numbers: ["2025타경1345", "2024타경9999", ...]
+        """
+        session = self._acquire_session()
+        all_items: list[AuctionItem] = []
+        seen: set[str] = set()
+
+        for cs_no in case_numbers:
+            cs_no = cs_no.strip()
+            if not cs_no:
+                continue
+            self.log(f"🔍 사건번호 직접 조회: {cs_no}")
+            body = copy.deepcopy(_POST_TEMPLATE)
+            info = body["dma_srchGdsDtlSrchInfo"]
+            info["csNo"]    = cs_no
+            info["statNum"] = stat_num
+            # 지역 필터 없이 사건번호만으로 검색
+            info["rprsAdongSdCd"]  = ""
+            info["rprsAdongSggCd"] = ""
+
+            try:
+                resp = session.post(
+                    SEARCH_URL,
+                    data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                    headers=self._post_headers(),
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                self.log(f"   ⚠️ [{cs_no}] 요청 실패: {exc}")
+                continue
+
+            if data.get("status") != 200:
+                self.log(f"   ⚠️ [{cs_no}] 응답 오류: {data.get('message')}")
+                continue
+
+            items = self._parse_response(data)
+            # 입력한 사건번호와 실제로 매칭되는 것만 (부분 포함)
+            cs_core = cs_no.replace(" ", "")
+            matched = [
+                it for it in items
+                if cs_core in it.case_number.replace(" ", "")
+                or it.case_number.replace(" ", "") in cs_core
+            ]
+            added = 0
+            for item in (matched or items):
+                if item.case_number not in seen:
+                    item.status = "경매전"  # 경매 미시작 표시
+                    all_items.append(item)
+                    seen.add(item.case_number)
+                    added += 1
+            if added:
+                self.log(f"   ✅ [{cs_no}] {added}건 추가")
+            else:
+                self.log(f"   ℹ️ [{cs_no}] 검색 결과 없음 (statNum={stat_num!r})")
+
+        return all_items
+
     def search_multi(
         self,
         sido: str,

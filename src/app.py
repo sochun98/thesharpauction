@@ -150,6 +150,16 @@ with st.sidebar:
     )
 
     st.divider()
+    st.header("📋 경매전 물건 추가")
+    extra_cases_input = st.text_area(
+        "사건번호 직접 입력 (경매 미시작 포함)",
+        placeholder="예:\n2025타경1345\n2024타경9999",
+        height=100,
+        help="사건번호가 있지만 경매 기일이 아직 잡히지 않은 물건을 줄 단위로 입력하세요.\n"
+             "지도에 주황색 마커로 별도 표시됩니다.",
+    )
+
+    st.divider()
     search_btn = st.button("🔍 검색 시작", width="stretch", type="primary")
 
     st.divider()
@@ -274,6 +284,34 @@ if search_btn:
             st.code(str(e), language="text")
             st.stop()
 
+    # ── Step 2-b: 추가 사건번호 직접 조회 (경매 미시작 포함) ──────────
+    extra_case_list = [
+        c.strip() for c in extra_cases_input.replace(",", "\n").splitlines()
+        if c.strip()
+    ]
+    if extra_case_list:
+        with st.status(
+            f"📋 추가 사건번호 {len(extra_case_list)}건 조회 중...", expanded=True
+        ) as _cs_status:
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    extra_items = executor.submit(
+                        scraper.search_by_case_numbers,
+                        extra_case_list,
+                        "05",
+                    ).result(timeout=120)
+                # 기존 raw_items에 없는 것만 추가
+                existing_ids = {it.case_number for it in raw_items}
+                new_extra = [it for it in extra_items if it.case_number not in existing_ids]
+                raw_items = raw_items + new_extra
+                _cs_status.update(
+                    label=f"📋 추가 사건번호 {len(new_extra)}건 추가 (누계 {len(raw_items)}건)",
+                    state="complete",
+                )
+            except Exception as _cs_err:
+                _cs_status.update(label="추가 사건번호 조회 실패", state="error")
+                st.warning(f"추가 사건번호 조회 중 오류: {_cs_err}")
+
     if not raw_items:
         st.warning(
             f"{', '.join(sigungu_to_search)} 에서 경매 물건을 찾지 못했습니다. "
@@ -322,12 +360,13 @@ if search_btn:
                     "감정가(원)": item.appraised_value,
                     "최저매각가(원)": item.min_bid,
                     "낙찰가(원)": item.won_bid,
-                    "매각기일": item.auction_date,
+                    "매각기일": item.auction_date or "미정",
                     "유찰횟수": item.failure_count,
                     "거리(m)": int(dist),
                     "상세링크": item.detail_url,
                     "_lat": loc["lat"],
                     "_lng": loc["lng"],
+                    "_status": item.status,   # "경매전" or ""
                 }
                 all_with_dist.append(row)
 
@@ -372,6 +411,7 @@ if search_btn:
         "radius_m":      radius_m,
         "address_input": address_input,
         "log_path":      log_path,
+        "extra_cases":   extra_case_list,
     }
 
 # ── 캐시에서 결과 로드 (검색 후 리렌더링 포함) ────────
@@ -421,8 +461,10 @@ for row in filtered:
     )
     won = row.get("낙찰가(원)", 0)
     won_str = f"🏆 낙찰가: {won:,}원<br>" if won else ""
+    is_pre = row.get("_status") == "경매전"
+    status_badge = '<span style="background:#f90;color:#fff;padding:1px 5px;border-radius:3px;font-size:11px">경매전</span> ' if is_pre else ""
     popup_html = f"""
-    <b>{row['사건번호']}</b><br>
+    <b>{status_badge}{row['사건번호']}</b><br>
     <small>{row.get('용도설명') or row['물건종류']}</small><br>
     <hr style="margin:4px 0">
     📍 {row['소재지']}<br>
@@ -432,11 +474,13 @@ for row in filtered:
     🔄 유찰: {row['유찰횟수']}회 &nbsp; 거리: {row['거리(m)']}m
     {f'<br><a href="{row["상세링크"]}" target="_blank">상세보기 →</a>' if row['상세링크'] else ''}
     """
+    marker_color = "orange" if is_pre else "red"
+    tooltip_prefix = "[경매전] " if is_pre else ""
     folium.Marker(
         [row["_lat"], row["_lng"]],
         popup=folium.Popup(popup_html, max_width=280),
-        tooltip=f"{row['사건번호']} ({row['거리(m)']}m)",
-        icon=folium.Icon(color="red", icon="gavel", prefix="fa"),
+        tooltip=f"{tooltip_prefix}{row['사건번호']} ({row['거리(m)']}m)",
+        icon=folium.Icon(color=marker_color, icon="gavel", prefix="fa"),
     ).add_to(m)
 
 st_folium(m, width="100%", height=520, returned_objects=[])
@@ -449,7 +493,7 @@ sorted_filtered = sorted(filtered, key=lambda r: r["거리(m)"])
 
 df_display = (
     pd.DataFrame(sorted_filtered)
-    .drop(columns=["_lat", "_lng", "상세링크", "법원"], errors="ignore")
+    .drop(columns=["_lat", "_lng", "상세링크", "법원", "_status"], errors="ignore")
     .reset_index(drop=True)
 )
 df_display.index = df_display.index + 1  # 1-based 번호
