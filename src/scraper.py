@@ -263,25 +263,28 @@ class CourtAuctionScraper:
         self,
         case_numbers: list[str],
         stat_num: str = "05",
+        playwright_fallback: bool = True,
     ) -> list[AuctionItem]:
         """
         사건번호 목록으로 직접 검색 (경매 미시작 물건 포함).
-        case_numbers: ["2025타경1345", "2024타경9999", ...]
+
+        case_numbers          : ["2025타경1345", "2024타경9999", ...]
+        playwright_fallback   : True 이면 API 결과 없을 때 Playwright로 재시도
         """
         session = self._acquire_session()
         all_items: list[AuctionItem] = []
         seen: set[str] = set()
+        api_miss: list[str] = []   # API로 못 찾은 사건번호
 
         for cs_no in case_numbers:
             cs_no = cs_no.strip()
             if not cs_no:
                 continue
-            self.log(f"🔍 사건번호 직접 조회: {cs_no}")
+            self.log(f"🔍 사건번호 API 조회: {cs_no}")
             body = copy.deepcopy(_POST_TEMPLATE)
             info = body["dma_srchGdsDtlSrchInfo"]
             info["csNo"]    = cs_no
             info["statNum"] = stat_num
-            # 지역 필터 없이 사건번호만으로 검색
             info["rprsAdongSdCd"]  = ""
             info["rprsAdongSggCd"] = ""
 
@@ -296,14 +299,15 @@ class CourtAuctionScraper:
                 data = resp.json()
             except Exception as exc:
                 self.log(f"   ⚠️ [{cs_no}] 요청 실패: {exc}")
+                api_miss.append(cs_no)
                 continue
 
             if data.get("status") != 200:
                 self.log(f"   ⚠️ [{cs_no}] 응답 오류: {data.get('message')}")
+                api_miss.append(cs_no)
                 continue
 
             items = self._parse_response(data)
-            # 입력한 사건번호와 실제로 매칭되는 것만 (부분 포함)
             cs_core = cs_no.replace(" ", "")
             matched = [
                 it for it in items
@@ -313,16 +317,64 @@ class CourtAuctionScraper:
             added = 0
             for item in (matched or items):
                 if item.case_number not in seen:
-                    item.status = "경매전"  # 경매 미시작 표시
+                    item.status = "경매전"
                     all_items.append(item)
                     seen.add(item.case_number)
                     added += 1
             if added:
-                self.log(f"   ✅ [{cs_no}] {added}건 추가")
+                self.log(f"   ✅ [{cs_no}] API {added}건")
             else:
-                self.log(f"   ℹ️ [{cs_no}] 검색 결과 없음 (statNum={stat_num!r})")
+                self.log(f"   ℹ️ [{cs_no}] API 결과 없음 → Playwright 예정")
+                api_miss.append(cs_no)
+
+        # ── Playwright 폴백 ──────────────────────────────────────────────
+        if playwright_fallback and api_miss:
+            self.log(f"🎭 Playwright 폴백: {len(api_miss)}건")
+            from detail_scraper import fetch_case_detail_data
+            for cs_no in api_miss:
+                if cs_no in seen:
+                    continue
+                self.log(f"   🎭 [{cs_no}] Playwright 조회 중...")
+                try:
+                    d = fetch_case_detail_data(
+                        cs_no,
+                        court_name="",
+                        headless=self.headless,
+                    )
+                except Exception as exc:
+                    self.log(f"   ⚠️ [{cs_no}] Playwright 실패: {exc}")
+                    continue
+
+                if d is None:
+                    self.log(f"   ℹ️ [{cs_no}] 사이트에서도 미발견")
+                    continue
+
+                item = self._dict_to_item(cs_no, d)
+                if item and item.case_number not in seen:
+                    all_items.append(item)
+                    seen.add(item.case_number)
+                    self.log(
+                        f"   ✅ [{cs_no}] Playwright 파싱 완료: {item.address[:30]}"
+                    )
 
         return all_items
+
+    def _dict_to_item(self, cs_no: str, d: dict) -> Optional["AuctionItem"]:
+        """fetch_case_detail_data() 결과 dict → AuctionItem 변환."""
+        item = AuctionItem()
+        item.case_number     = d.get("case_number") or cs_no
+        item.court           = d.get("court", "")
+        item.address         = d.get("address", "")
+        item.geo_address     = d.get("geo_address", "") or d.get("address", "")
+        item.property_desc   = d.get("property_desc", "")
+        item.property_type   = d.get("property_desc", "")  # API 없으면 desc 재사용
+        item.appraised_value = d.get("appraised_value", 0)
+        item.min_bid         = d.get("min_bid", 0)
+        item.auction_date    = d.get("auction_date", "")
+        item.failure_count   = d.get("failure_count", 0)
+        item.detail_url      = d.get("detail_url", "")
+        item.status          = "경매전"
+        return item
 
     def search_multi(
         self,

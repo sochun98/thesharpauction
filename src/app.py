@@ -158,6 +158,12 @@ with st.sidebar:
         help="사건번호가 있지만 경매 기일이 아직 잡히지 않은 물건을 줄 단위로 입력하세요.\n"
              "지도에 주황색 마커로 별도 표시됩니다.",
     )
+    use_playwright_fallback = st.checkbox(
+        "API 실패 시 Playwright 자동 보완",
+        value=True,
+        help="API로 사건번호를 찾지 못하면 법원경매 사이트에 직접 접속해서\n"
+             "주소·감정가 등을 파싱합니다. 건당 약 20~30초 소요됩니다.",
+    )
 
     st.divider()
     search_btn = st.button("🔍 검색 시작", width="stretch", type="primary")
@@ -290,17 +296,21 @@ if search_btn:
         if c.strip()
     ]
     if extra_case_list:
+        _pw_note = " (API 실패 시 Playwright 자동 보완, 건당 ~25초)" if use_playwright_fallback else ""
         with st.status(
-            f"📋 추가 사건번호 {len(extra_case_list)}건 조회 중...", expanded=True
+            f"📋 추가 사건번호 {len(extra_case_list)}건 조회 중{_pw_note}...",
+            expanded=True,
         ) as _cs_status:
             try:
+                # Playwright 폴백 포함 시 timeout을 건당 40초로 여유있게 설정
+                _timeout = 60 + len(extra_case_list) * 40 if use_playwright_fallback else 120
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     extra_items = executor.submit(
                         scraper.search_by_case_numbers,
                         extra_case_list,
                         "05",
-                    ).result(timeout=120)
-                # 기존 raw_items에 없는 것만 추가
+                        use_playwright_fallback,
+                    ).result(timeout=_timeout)
                 existing_ids = {it.case_number for it in raw_items}
                 new_extra = [it for it in extra_items if it.case_number not in existing_ids]
                 raw_items = raw_items + new_extra
