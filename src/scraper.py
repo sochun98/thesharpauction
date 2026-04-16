@@ -231,10 +231,12 @@ class AuctionItem:
     case_number:     str = ""
     court:           str = ""
     property_type:   str = ""
+    property_desc:   str = ""       # dspslUsgNm: 실제 용도 텍스트 (근린생활시설, 상가 등)
     address:         str = ""       # 표시용 전체 주소
     geo_address:     str = ""       # 지오코딩 전용 (시도+시군구+동+지번만)
     appraised_value: int = 0
     min_bid:         int = 0
+    won_bid:         int = 0        # 낙찰가 (진행중이면 0)
     auction_date:    str = ""
     status:          str = ""
     failure_count:   int = 0
@@ -262,10 +264,12 @@ class CourtAuctionScraper:
         sigungu_list: list[str],
         max_pages: int = 5,
         util_code: str = "",
+        stat_num: str = "05",
     ) -> list[AuctionItem]:
         """
         여러 시군구를 하나의 세션으로 검색 (중복 사건번호 자동 제거).
         sigungu_list에 빈 문자열("")을 포함하면 시도 전체를 검색함.
+        stat_num: "05"=전체(낙찰완료 포함), ""=진행중만
         """
         sido_code = self._resolve_sido(sido)
         session   = self._acquire_session()
@@ -277,7 +281,7 @@ class CourtAuctionScraper:
             label = sigungu or "시도전체"
             self.log(f"🔍 [{label}] 검색 중...")
             items = self._fetch_all_pages(
-                session, sido_code, sgg_code, max_pages, util_code
+                session, sido_code, sgg_code, max_pages, util_code, stat_num
             )
             added = 0
             for item in items:
@@ -296,17 +300,19 @@ class CourtAuctionScraper:
         sigungu: str = "",
         max_pages: int = 5,
         util_code: str = "",
+        stat_num: str = "05",
     ) -> list[AuctionItem]:
         """
         util_code: 대분류 용도코드 (예: "30000" = 상업용, "" = 전체)
+        stat_num:  "05"=전체(낙찰완료 포함), ""=진행중만
         """
         sido_code = self._resolve_sido(sido)
         sgg_code  = self._resolve_sgg(sido_code, sigungu)
-        label = f"시도={sido_code}, 시군구={sgg_code or '전체'}, 용도={util_code or '전체'}"
+        label = f"시도={sido_code}, 시군구={sgg_code or '전체'}, 용도={util_code or '전체'}, statNum={stat_num or '진행중'}"
         self.log(f"📍 코드: {label}")
 
         session = self._acquire_session()
-        return self._fetch_all_pages(session, sido_code, sgg_code, max_pages, util_code)
+        return self._fetch_all_pages(session, sido_code, sgg_code, max_pages, util_code, stat_num)
 
     # ────────────────────────────────────────────────────────────────
     # 코드 조회
@@ -388,7 +394,8 @@ class CourtAuctionScraper:
     # ────────────────────────────────────────────────────────────────
 
     def _build_body(
-        self, sido_code: str, sgg_code: str, page_no: int, util_code: str = ""
+        self, sido_code: str, sgg_code: str, page_no: int,
+        util_code: str = "", stat_num: str = "05",
     ) -> dict:
         body = copy.deepcopy(_POST_TEMPLATE)
         body["dma_pageInfo"]["pageNo"]  = page_no
@@ -397,6 +404,7 @@ class CourtAuctionScraper:
         info["rprsAdongSdCd"]       = sido_code
         info["rprsAdongSggCd"]      = sgg_code
         info["lclDspslGdsLstUsgCd"] = util_code
+        info["statNum"]             = stat_num   # "05"=전체, ""=진행중
         return body
 
     def _post_headers(self) -> dict[str, str]:
@@ -418,6 +426,7 @@ class CourtAuctionScraper:
         sgg_code: str,
         max_pages: int,
         util_code: str = "",
+        stat_num: str = "05",
     ) -> list[AuctionItem]:
 
         all_items: list[AuctionItem] = []
@@ -425,7 +434,7 @@ class CourtAuctionScraper:
         page_size = _POST_TEMPLATE["dma_pageInfo"]["pageSize"]
 
         for page_no in range(1, max_pages + 1):
-            body = self._build_body(sido_code, sgg_code, page_no, util_code)
+            body = self._build_body(sido_code, sgg_code, page_no, util_code, stat_num)
             self.log(f"   📄 페이지 {page_no} 요청 중...")
 
             try:
@@ -505,8 +514,12 @@ class CourtAuctionScraper:
         if not item.property_type:
             item.property_type = row.get("lclsUtilCd", "")
 
+        # 실제 용도 텍스트 (근린생활시설, 상가 등 직접 기재된 값)
+        item.property_desc = row.get("dspslUsgNm", "").strip()
+
         item.appraised_value = self._to_int(row.get("gamevalAmt",  ""))
         item.min_bid         = self._to_int(row.get("minmaePrice", ""))
+        item.won_bid         = self._to_int(row.get("maeAmt",      ""))
         item.failure_count   = self._to_int(row.get("yuchalCnt",   ""))
 
         d = row.get("maeGiil", "")
