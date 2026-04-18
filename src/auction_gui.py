@@ -6,11 +6,26 @@
 """
 
 import json
+import logging
 import os
 import sys
 import tempfile
 import time
+import traceback
 from datetime import datetime
+
+# ── 로그 파일 설정 ────────────────────────────────────────────────────────────
+_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+_LOG_FILE = os.path.join(_LOG_DIR, f"auction_gui_{datetime.now().strftime('%Y%m%d')}.log")
+
+logging.basicConfig(
+    filename=_LOG_FILE,
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    encoding="utf-8",
+)
+_logger = logging.getLogger("auction_gui")
 
 import folium
 
@@ -81,7 +96,9 @@ class CollectThread(QThread):
             )
             self.done_signal.emit(len(records))
         except Exception as e:
-            self.error_signal.emit(str(e))
+            tb = traceback.format_exc()
+            _logger.error("수집 오류:\n%s", tb)
+            self.error_signal.emit(f"{e}\n\n{tb}")
 
 
 class GeocodeThread(QThread):
@@ -108,6 +125,7 @@ class GeocodeThread(QThread):
                 ok += 1
                 time.sleep(0.05)
             except Exception as e:
+                _logger.warning("지오코딩 실패 [%s]: %s", addr, e)
                 fail += 1
             if (i + 1) % 10 == 0:
                 self.log_signal.emit(f"  지오코딩 {i+1}/{len(self.records)}건 (성공 {ok}, 실패 {fail})")
@@ -132,7 +150,9 @@ class DetailThread(QThread):
             )
             self.done_signal.emit(img)
         except Exception as e:
-            self.error_signal.emit(str(e))
+            tb = traceback.format_exc()
+            _logger.error("상세조회 오류:\n%s", tb)
+            self.error_signal.emit(f"{e}\n\n{tb}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -163,7 +183,8 @@ class AuctionMainWindow(QMainWindow):
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("준비")
+        self.status_bar.showMessage(f"준비  |  로그: {_LOG_FILE}")
+        _logger.info("=== auction_gui 시작 ===")
 
     # ── [수집] 탭 ─────────────────────────────────────────────────────────────
 
@@ -385,12 +406,15 @@ class AuctionMainWindow(QMainWindow):
         self.btn_connect.setText("연결 중...")
         QApplication.processEvents()
         try:
+            self._log(f"DB 연결 시도: {self.db_host.text()}:{self.db_port.text()} / {self.db_name.text()}")
             eng = get_engine(
                 self.db_host.text(), self.db_port.text(),
                 self.db_user.text(), self.db_pass.text(),
                 self.db_name.text(),
             )
+            self._log("DB/테이블 초기화 중...")
             init_db(eng)
+            self._log("연결 테스트 중...")
             ok, msg = test_connection(eng)
             if ok:
                 self.engine = eng
@@ -404,7 +428,11 @@ class AuctionMainWindow(QMainWindow):
             else:
                 raise RuntimeError(msg)
         except Exception as e:
-            QMessageBox.critical(self, "DB 연결 실패", str(e))
+            tb = traceback.format_exc()
+            _logger.error("DB 연결 오류:\n%s", tb)
+            self._log(f"❌ DB 연결 실패:\n{tb}")
+            QMessageBox.critical(self, "DB 연결 실패",
+                                 f"{e}\n\n자세한 내용은 로그 창 및\n{_LOG_FILE}\n을 확인하세요.")
             self.btn_connect.setEnabled(True)
             self.btn_connect.setText("🔌  연결 & 테이블 초기화")
 
@@ -474,10 +502,13 @@ class AuctionMainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
 
     def _log(self, msg: str):
-        self.log_edit.append(msg)
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        self.log_edit.append(line)
         self.log_edit.verticalScrollBar().setValue(
             self.log_edit.verticalScrollBar().maximum()
         )
+        _logger.info(msg)
 
     # ── 지도 탭 ───────────────────────────────────────────────────────────────
 
