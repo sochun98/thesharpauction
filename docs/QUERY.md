@@ -4,7 +4,42 @@
 
 ---
 
-## 2026-04-18
+## 2026-04-18 (2)
+
+**Q. 시군구 단위 분할 수집, 상한 증가, GUI(수집+지도), MySQL 저장을 구현하라.**
+
+A. 세 파일로 구현.
+
+**src/db.py** (신규)
+- MySQL `auction_cases` 테이블 (35개 컬럼 + lat/lng + 인덱스)
+- `upsert_records`: ON DUPLICATE KEY UPDATE (case_no + item_no 기준)
+- `load_map_data`, `load_case_detail`, `update_geocode`
+- `load_ungeocode_records`: 좌표 없는 레코드 배치 조회
+
+**src/collector.py** (수정)
+- `collect_sido_year`: sgg_code 파라미터 추가, 상한 1000페이지, save_fn 콜백
+- `collect_by_sigungu`: 시도 내 시군구 목록 × 연도 분할 수집
+- `get_sigungu_list(sido_name)`: 시도별 시군구 목록 반환
+- CLI: `--sigungu`, `--mysql` 옵션 추가
+
+**src/collector_app.py** (신규) — `streamlit run src/collector_app.py`
+- [수집] 탭: 시도/시군구/연도 선택 → collect_by_sigungu → MySQL upsert → 실시간 로그
+- [지도] 탭: DB 데이터 조회 → folium 지도 (상태별 색상: 진행중=빨강, 낙찰=파랑, 재매각=주황)
+             → 좌표 보완 버튼 (네이버 API 배치 지오코딩)
+             → 사건번호 선택 → 상세보기 (Playwright 스크린샷)
+
+**MySQL 환경변수** (`env_thesharpcharm.env`에 추가):
+```
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_USER=root
+MYSQL_PASSWORD=(비밀번호)
+MYSQL_DATABASE=auction_db
+```
+
+---
+
+## 2026-04-18 (1)
 
 **Q. 경기도 2026년 수집 결과는 어떻게 되었는가?**
 
