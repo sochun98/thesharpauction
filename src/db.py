@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS auction_cases (
     building      VARCHAR(100)           COMMENT '건물명',
     unit          VARCHAR(200)           COMMENT '동호수',
     address       TEXT                   COMMENT '전체주소',
-    usage         VARCHAR(50)            COMMENT '용도',
+    `usage`       VARCHAR(50)            COMMENT '용도',
     usage_code_l  VARCHAR(10)            COMMENT '용도대분류코드',
     usage_code_m  VARCHAR(10)            COMMENT '용도중분류코드',
     struct_area   TEXT                   COMMENT '구조면적',
@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS auction_cases (
     decision_date VARCHAR(12)            COMMENT '매각결정기일',
     auction_place VARCHAR(100)           COMMENT '매각장소',
     auction_count INT          DEFAULT 0 COMMENT '매각기일횟수',
-    status        VARCHAR(20)            COMMENT '물건상태',
+    `status`      VARCHAR(20)            COMMENT '물건상태',
     status_code   VARCHAR(5)             COMMENT '물건상태코드',
     ongoing       VARCHAR(1)             COMMENT '진행여부(Y/N)',
     target_no     INT          DEFAULT 1 COMMENT '목적물번호',
@@ -253,9 +253,9 @@ def load_map_data(
     sql = f"""
         SELECT
             case_no, item_no, court, sido, sigungu, dong, address,
-            usage, usage_code_l, area_min, area_max,
+            `usage`, usage_code_l, area_min, area_max,
             appraisal, min_bid, won_bid, fail_count,
-            auction_date, status, status_code, ongoing,
+            auction_date, `status`, status_code, ongoing,
             lat, lng
         FROM auction_cases
         WHERE {' AND '.join(where)}
