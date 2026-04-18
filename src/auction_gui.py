@@ -31,6 +31,7 @@ import folium
 
 from PySide6.QtCore import Qt, QThread, Signal, QUrl, QTimer
 from PySide6.QtGui import QFont, QColor, QIcon
+from PySide6.QtWebEngineCore import QWebEnginePage
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget,
@@ -58,7 +59,6 @@ from db import (
     get_ungeocode_count, load_ungeocode_records,
 )
 from geocoder import geocode
-from detail_scraper import fetch_case_detail_screenshot
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -132,27 +132,103 @@ class GeocodeThread(QThread):
         self.done_signal.emit(ok, fail)
 
 
-class DetailThread(QThread):
-    done_signal  = Signal(bytes)
+class OpenBrowserThread(QThread):
+    """
+    Playwright 비헤드리스 브라우저를 열고 법원경매 사건 상세 페이지로 이동합니다.
+    사용자가 브라우저를 직접 닫을 때까지 스레드가 살아있어 브라우저가 유지됩니다.
+    """
+    ready_signal = Signal()   # 페이지 이동 완료 (브라우저는 아직 열려 있음)
     error_signal = Signal(str)
 
-    def __init__(self, case_no, court, headless, navigate):
+    def __init__(self, case_no: str, court: str):
         super().__init__()
-        self.case_no  = case_no
-        self.court    = court
-        self.headless = headless
-        self.navigate = navigate
+        self.case_no = case_no
+        self.court   = court
 
     def run(self):
+        from playwright.sync_api import sync_playwright
+        from detail_scraper import (
+            parse_case_number, BASE_URL, SEARCH_URL,
+            _wait_websquare, _select_court, _select_option_by_value,
+            _get_result_count, _click_first_result,
+        )
+        parsed = parse_case_number(self.case_no)
         try:
-            img = fetch_case_detail_screenshot(
-                self.case_no, self.court, self.headless, self.navigate
-            )
-            self.done_signal.emit(img)
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=False,
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
+                ctx = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1400, "height": 900},
+                )
+                page = ctx.new_page()
+
+                page.goto(f"{BASE_URL}/pgj/index.on",
+                          wait_until="domcontentloaded", timeout=60_000)
+                _wait_websquare(page)
+                page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=60_000)
+                _wait_websquare(page)
+                _select_court(page, self.court)
+                if parsed["year"]:
+                    _select_option_by_value(
+                        page,
+                        "#mf_wfm_mainFrame_sbx_auctnCsSrchCsYear",
+                        parsed["year"],
+                    )
+                case_no_field = page.locator("#mf_wfm_mainFrame_ibx_auctnCsSrchCsNo")
+                case_no_field.fill(parsed["type"] + parsed["num"])
+                time.sleep(0.3)
+                page.locator("#mf_wfm_mainFrame_btn_auctnCsSrchBtn").click()
+                time.sleep(3)
+                result_count = _get_result_count(page)
+                if result_count == 0:
+                    case_no_field.fill(parsed["num"])
+                    time.sleep(0.3)
+                    page.locator("#mf_wfm_mainFrame_btn_auctnCsSrchBtn").click()
+                    time.sleep(3)
+                _click_first_result(page)
+                time.sleep(3)
+
+                self.ready_signal.emit()
+
+                # 사용자가 브라우저를 닫을 때까지 대기
+                while browser.is_connected():
+                    time.sleep(1)
+
         except Exception as e:
             tb = traceback.format_exc()
-            _logger.error("상세조회 오류:\n%s", tb)
+            _logger.error("브라우저 열기 오류:\n%s", tb)
             self.error_signal.emit(f"{e}\n\n{tb}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 지도 페이지 (auction-case:// 링크 가로채기)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MapPage(QWebEnginePage):
+    """
+    Folium 지도 HTML 안의 마커 팝업 링크 클릭을 가로채는 커스텀 페이지.
+    팝업에 삽입된 <a href="auction-case://row/숫자"> 링크가 클릭되면
+    row_requested 시그널(행 인덱스)을 발생시키고 실제 내비게이션은 막습니다.
+    """
+    row_requested = Signal(int)
+
+    def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+        if url.scheme() == "auction-case":
+            # 경로 예: /row/0
+            parts = url.path().strip("/").split("/")
+            try:
+                self.row_requested.emit(int(parts[-1]))
+            except (ValueError, IndexError):
+                pass
+            return False   # 내비게이션 차단 → 지도 유지
+        return super().acceptNavigationRequest(url, nav_type, is_main_frame)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -335,8 +411,10 @@ class AuctionMainWindow(QMainWindow):
         # ── 지도 + 테이블 분할 ─────────────────────────────────────────────
         splitter = QSplitter(Qt.Orientation.Vertical)
 
-        # 지도 (QWebEngineView)
+        # 지도 (QWebEngineView + MapPage)
+        self.map_page = MapPage(self)
         self.web_view = QWebEngineView()
+        self.web_view.setPage(self.map_page)
         self.web_view.setMinimumHeight(320)
         splitter.addWidget(self.web_view)
 
@@ -358,16 +436,14 @@ class AuctionMainWindow(QMainWindow):
         self.map_table.setMinimumHeight(180)
         table_lay.addWidget(self.map_table)
 
-        # 상세보기 영역
+        # 상세보기 영역 (지도 마커 클릭 또는 버튼으로 브라우저 열기)
         detail_row = QHBoxLayout()
-        self.chk_headless = QCheckBox("브라우저 창 표시")
-        self.chk_navigate = QCheckBox("상세 페이지까지 이동")
-        self.chk_navigate.setChecked(True)
-        self.btn_detail   = QPushButton("⚖️  법원경매 사이트 상세보기")
+        detail_hint = QLabel("💡 마커 팝업의 링크 클릭 또는 행 선택 후 버튼 클릭으로 법원경매 사이트를 엽니다")
+        detail_hint.setStyleSheet("color: #555; font-size: 11px;")
+        self.btn_detail = QPushButton("⚖️  선택 사건 법원경매 상세보기")
         self.btn_detail.setFixedHeight(34)
         self.btn_detail.setEnabled(False)
-        detail_row.addWidget(self.chk_headless)
-        detail_row.addWidget(self.chk_navigate)
+        detail_row.addWidget(detail_hint)
         detail_row.addStretch()
         detail_row.addWidget(self.btn_detail)
         table_lay.addLayout(detail_row)
@@ -395,6 +471,7 @@ class AuctionMainWindow(QMainWindow):
         self.btn_geocode.clicked.connect(self._on_geocode)
         self.map_table.itemSelectionChanged.connect(self._on_table_select)
         self.btn_detail.clicked.connect(self._on_detail)
+        self.map_page.row_requested.connect(self._on_map_row_click)
 
         # 초기 시군구 목록 로드
         self._on_sido_changed(self.sido_combo.currentText())
@@ -590,7 +667,7 @@ class AuctionMainWindow(QMainWindow):
             "진행중": "red", "낙찰": "blue", "재매각": "orange",
             "취하": "gray", "취소": "gray",
         }
-        for row in rows:
+        for idx, row in enumerate(rows):
             color = STATUS_COLOR.get(row.get("status", ""), "purple")
             appr  = row.get("appraisal") or 0
             mb    = row.get("min_bid")   or 0
@@ -603,12 +680,16 @@ class AuctionMainWindow(QMainWindow):
                 f"💰 감정가: {appr:,}원<br>"
                 f"🔖 최저가: {mb:,}원 ({ratio})<br>"
                 f"📅 {row.get('auction_date','-')} | 유찰 {row.get('fail_count',0)}회<br>"
-                f"<b>{row.get('status','-')}</b>"
+                f"<b>{row.get('status','-')}</b><br>"
+                f"<hr style='margin:4px 0'>"
+                f"<a href='auction-case://row/{idx}' "
+                f"style='color:#1565c0;font-weight:bold;text-decoration:underline;'>"
+                f"⚖️ 법원경매 상세보기</a>"
             )
             folium.CircleMarker(
                 location=[row["lat"], row["lng"]],
                 radius=7, color=color, fill=True, fill_opacity=0.75,
-                popup=folium.Popup(popup_html, max_width=250),
+                popup=folium.Popup(popup_html, max_width=260),
                 tooltip=f"{row['case_no']} ({row.get('status','')})",
             ).add_to(m)
 
@@ -657,7 +738,8 @@ class AuctionMainWindow(QMainWindow):
                 self.map_table.setItem(i, j, item)
 
     def _on_table_select(self):
-        self.btn_detail.setEnabled(bool(self.map_table.selectedItems()))
+        sel = self.map_table.selectedItems()
+        self.btn_detail.setEnabled(bool(sel))
 
     # ── 좌표 보완 ─────────────────────────────────────────────────────────────
 
@@ -696,45 +778,50 @@ class AuctionMainWindow(QMainWindow):
     # ── 상세보기 ──────────────────────────────────────────────────────────────
 
     def _on_detail(self):
-        rows = self.map_table.selectedItems()
-        if not rows:
+        """테이블에서 선택된 행의 사건을 브라우저로 열기."""
+        if not self.map_table.selectedItems():
             return
+        row_idx = self.map_table.currentRow()
+        # 테이블 행과 _map_rows 인덱스가 일치
+        self._open_case_browser(row_idx)
 
-        row_idx  = self.map_table.currentRow()
-        case_no  = self.map_table.item(row_idx, 0).text()
-        item_no  = int(self.map_table.item(row_idx, 1).text())
+    def _on_map_row_click(self, idx: int):
+        """지도 마커 팝업 링크 클릭 시 호출."""
+        if 0 <= idx < len(self._map_rows):
+            self._open_case_browser(idx)
 
-        detail = load_case_detail(self.engine, case_no, item_no) if self.engine else {}
-        court  = (detail or {}).get("court", "")
-
-        headless = not self.chk_headless.isChecked()
-        navigate = self.chk_navigate.isChecked()
+    def _open_case_browser(self, row_idx: int):
+        """_map_rows[row_idx] 사건을 Playwright 브라우저로 열기."""
+        if row_idx < 0 or row_idx >= len(self._map_rows):
+            return
+        row     = self._map_rows[row_idx]
+        case_no = row.get("case_no", "")
+        court   = row.get("court", "")
 
         self.btn_detail.setEnabled(False)
-        self.btn_detail.setText("조회 중... (~20초)")
-        self.status_bar.showMessage(f"{case_no} 법원경매 사이트 조회 중...")
+        self.btn_detail.setText("브라우저 여는 중... (~20초)")
+        self.status_bar.showMessage(f"{case_no} — 법원경매 사이트 브라우저 열는 중...")
+        _logger.info("브라우저 열기: %s (%s)", case_no, court)
 
-        self._det_thread = DetailThread(case_no, court, headless, navigate)
-        self._det_thread.done_signal.connect(self._on_detail_done)
+        self._det_thread = OpenBrowserThread(case_no, court)
+        self._det_thread.ready_signal.connect(self._on_browser_ready)
         self._det_thread.error_signal.connect(self._on_detail_error)
         self._det_thread.start()
 
-    def _on_detail_done(self, img_bytes: bytes):
+    def _on_browser_ready(self):
+        """Playwright 브라우저에서 상세 페이지 로드 완료."""
         self.btn_detail.setEnabled(True)
-        self.btn_detail.setText("⚖️  법원경매 사이트 상세보기")
-        self.status_bar.showMessage("상세 조회 완료")
-
-        # 임시 파일에 저장 후 웹뷰로 표시
-        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        tmp.write(img_bytes)
-        tmp.close()
-        self.web_view.load(QUrl.fromLocalFile(tmp.name))
+        self.btn_detail.setText("⚖️  선택 사건 법원경매 상세보기")
+        self.status_bar.showMessage(
+            "법원경매 사이트가 브라우저에서 열렸습니다 — 브라우저 창을 직접 닫으세요"
+        )
 
     def _on_detail_error(self, msg: str):
         self.btn_detail.setEnabled(True)
-        self.btn_detail.setText("⚖️  법원경매 사이트 상세보기")
-        self.status_bar.showMessage("상세 조회 실패")
-        QMessageBox.critical(self, "상세 조회 실패", msg)
+        self.btn_detail.setText("⚖️  선택 사건 법원경매 상세보기")
+        self.status_bar.showMessage("브라우저 열기 실패")
+        _logger.error("브라우저 열기 실패: %s", msg)
+        QMessageBox.critical(self, "브라우저 열기 실패", msg[:500])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
