@@ -31,7 +31,7 @@ import folium
 
 from PySide6.QtCore import Qt, QThread, Signal, QUrl, QTimer
 from PySide6.QtGui import QFont, QColor, QIcon
-from PySide6.QtWebEngineCore import QWebEnginePage
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget,
@@ -428,6 +428,10 @@ class AuctionMainWindow(QMainWindow):
 
         # 지도 (QWebEngineView + MapPage)
         self.map_page = MapPage(self)
+        # file:// 로컬 HTML에서 CDN(Leaflet JS·타일 서버) 접근 허용
+        s = self.map_page.settings()
+        s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
         self.web_view = QWebEngineView()
         self.web_view.setPage(self.map_page)
         self.web_view.setMinimumHeight(320)
