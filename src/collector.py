@@ -298,11 +298,14 @@ def collect_by_sigungu(
     max_pages: int = 1000,
     log_fn=print,
     save_fn=None,
+    skip_fn=None,
 ) -> list[dict]:
     """
     시도 내 지정 시군구 목록 × 연도 분할 수집.
     sigungu_names: [] 이면 해당 시도의 모든 시군구 수집.
     save_fn: (records) -> None — MySQL 저장 콜백.
+    skip_fn: (sgg_name: str, year: int) -> bool
+        True 반환 시 해당 조합을 API 호출 없이 건너뜀.
     """
     sido_code = SIDO_BY_NAME.get(sido_name, "")
     if not sido_code:
@@ -326,6 +329,10 @@ def collect_by_sigungu(
     for sgg_name, sgg_code in target_sgg:
         for year in years:
             label = f"{sido_name} {sgg_name} {year}년"
+            if skip_fn and skip_fn(sgg_name, year):
+                log_fn(f"\n{'─'*50}")
+                log_fn(f"  ⏭ 건너뜀 (이미 수집됨): {label}")
+                continue
             log_fn(f"\n{'─'*50}")
             log_fn(f"  수집: {label}")
             records = collect_sido_year(

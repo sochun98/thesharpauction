@@ -325,6 +325,26 @@ def get_ungeocode_count(engine: Engine, sido: str = "", sigungu: str = "") -> in
         return conn.execute(text(sql), params).scalar() or 0
 
 
+def get_collected_count(engine: Engine, sigungu: str, year: int) -> int:
+    """
+    특정 시군구·연도 조합의 수집된 레코드 수 반환.
+    auction_date가 해당 연도(YYYY로 시작)인 레코드를 집계.
+    sigungu가 빈 문자열이면 연도 전체 count 반환.
+    """
+    if sigungu:
+        sql = """
+            SELECT COUNT(*) FROM auction_cases
+            WHERE sigungu = :sigungu
+              AND auction_date LIKE :year_pat
+        """
+        params: dict = {"sigungu": sigungu, "year_pat": f"{year}%"}
+    else:
+        sql = "SELECT COUNT(*) FROM auction_cases WHERE auction_date LIKE :year_pat"
+        params = {"year_pat": f"{year}%"}
+    with engine.connect() as conn:
+        return conn.execute(text(sql), params).scalar() or 0
+
+
 def load_ungeocode_records(engine: Engine, sido: str = "", sigungu: str = "", limit: int = 500) -> list[dict]:
     """좌표 없는 레코드 조회 (지오코딩 보완용)."""
     where = ["lat IS NULL", "address IS NOT NULL", "address != ''"]

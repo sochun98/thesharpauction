@@ -57,6 +57,7 @@ from db import (
     load_map_data, load_case_detail, update_geocode,
     get_distinct_sidos, get_distinct_sigungus,
     get_ungeocode_count, load_ungeocode_records,
+    get_collected_count,
 )
 from geocoder import geocode
 
@@ -70,7 +71,7 @@ class CollectThread(QThread):
     done_signal  = Signal(int)   # 완료된 레코드 수
     error_signal = Signal(str)
 
-    def __init__(self, sido, sgus, years, util_code, delay, save_fn):
+    def __init__(self, sido, sgus, years, util_code, delay, save_fn, skip_fn=None):
         super().__init__()
         self.sido      = sido
         self.sgus      = sgus
@@ -78,6 +79,7 @@ class CollectThread(QThread):
         self.util_code = util_code
         self.delay     = delay
         self.save_fn   = save_fn
+        self.skip_fn   = skip_fn
         self._stop     = False
 
     def run(self):
@@ -93,6 +95,7 @@ class CollectThread(QThread):
                 max_pages=1000,
                 log_fn=self.log_signal.emit,
                 save_fn=self.save_fn,
+                skip_fn=self.skip_fn,
             )
             self.done_signal.emit(len(records))
         except Exception as e:
@@ -298,7 +301,7 @@ class AuctionMainWindow(QMainWindow):
         db_layout.addWidget(QLabel("Password"), 1, 2); db_layout.addWidget(self.db_pass, 1, 3)
         db_layout.addWidget(QLabel("Database"), 2, 0); db_layout.addWidget(self.db_name, 2, 1)
 
-        self.btn_connect = QPushButton("🔌  연결 & 테이블 초기화")
+        self.btn_connect = QPushButton("🔌  DB 연결 & 테이블 생성")
         self.btn_connect.setFixedHeight(32)
         db_layout.addWidget(self.btn_connect, 2, 2, 1, 2)
         layout.addWidget(db_box)
@@ -501,7 +504,7 @@ class AuctionMainWindow(QMainWindow):
                 self.db_user.text(), self.db_pass.text(),
                 self.db_name.text(),
             )
-            self._log("DB/테이블 초기화 중...")
+            self._log("테이블 확인 중 (없으면 생성)...")
             init_db(eng)
             self._log("연결 테스트 중...")
             ok, msg = test_connection(eng)
@@ -523,7 +526,7 @@ class AuctionMainWindow(QMainWindow):
             QMessageBox.critical(self, "DB 연결 실패",
                                  f"{e}\n\n자세한 내용은 로그 창 및\n{_LOG_FILE}\n을 확인하세요.")
             self.btn_connect.setEnabled(True)
-            self.btn_connect.setText("🔌  연결 & 테이블 초기화")
+            self.btn_connect.setText("🔌  DB 연결 & 테이블 생성")
 
     # ── 수집 탭 ───────────────────────────────────────────────────────────────
 
@@ -560,8 +563,13 @@ class AuctionMainWindow(QMainWindow):
         engine = self.engine
         save_fn = lambda recs: upsert_records(engine, recs)
 
+        # 이미 수집된 (시군구, 연도) 조합은 건너뛰는 콜백
+        def skip_fn(sgu_name: str, year: int) -> bool:
+            cnt = get_collected_count(engine, sgu_name, year)
+            return cnt > 0
+
         self._collect_thread = CollectThread(
-            sido, sgus, years, util_code, self.delay_spin.value(), save_fn
+            sido, sgus, years, util_code, self.delay_spin.value(), save_fn, skip_fn
         )
         self._collect_thread.log_signal.connect(self._log)
         self._collect_thread.done_signal.connect(self._on_collect_done)
