@@ -112,12 +112,24 @@ class GeocodeThread(QThread):
         self.naver_secret = naver_secret
         self.engine       = engine
 
+    @staticmethod
+    def _clean_address(addr: str) -> str:
+        """
+        '사용본거지 : 경기도 ...' / '소재지 : 서울 ...' 처럼
+        법원 DB에서 붙는 한글 레이블 접두어를 제거한 뒤 실제 주소만 반환.
+        """
+        import re
+        # 패턴: 한글·공백으로 구성된 레이블 + ' :' 또는 ':' 다음의 내용이 주소
+        cleaned = re.sub(r'^[가-힣\s]{1,15}\s*:\s*', '', addr).strip()
+        return cleaned if cleaned else addr
+
     def run(self):
         ok, fail = 0, 0
         for i, row in enumerate(self.records):
-            addr = row.get("address", "")
-            if not addr:
+            raw_addr = row.get("address", "")
+            if not raw_addr:
                 continue
+            addr = self._clean_address(raw_addr)
             try:
                 loc = geocode(addr, self.naver_id, self.naver_secret)
                 update_geocode(self.engine, row["case_no"], row["item_no"],
