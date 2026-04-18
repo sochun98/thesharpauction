@@ -132,12 +132,21 @@ def get_engine(
 
 def init_db(engine: Engine) -> None:
     """DB가 없으면 생성, 테이블이 없으면 생성."""
-    # database 이름 추출 후 먼저 CREATE DATABASE
-    raw = str(engine.url)
-    # pymysql URL에서 database 이름 파싱
-    db_name = engine.url.database
-    base_url = str(engine.url).replace(f"/{db_name}", "/")
-    base_engine = create_engine(base_url + "?charset=utf8mb4", pool_pre_ping=True)
+    from sqlalchemy.engine import URL as SaURL
+
+    url     = engine.url
+    db_name = url.database
+
+    # 데이터베이스 이름 없이 기본 연결 URL 재구성 (password 노출 없이)
+    base_url = SaURL.create(
+        drivername=url.drivername,
+        username=url.username,
+        password=url.password,
+        host=url.host,
+        port=url.port,
+        query={"charset": "utf8mb4"},
+    )
+    base_engine = create_engine(base_url, pool_pre_ping=True)
     with base_engine.connect() as conn:
         conn.execute(text(
             f"CREATE DATABASE IF NOT EXISTS `{db_name}` "
