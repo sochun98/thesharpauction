@@ -57,6 +57,18 @@ def parse_case_number(case_number: str) -> dict:
     return {"year": "", "type": "타경", "num": cn}
 
 
+def _fill_case_no(page, selector: str, value: str) -> None:
+    """maxlength 제한을 JS로 해제한 뒤 입력 — 6자리 이상 사건번호 대응."""
+    page.evaluate(
+        """([sel]) => {
+            const el = document.querySelector(sel);
+            if (el) { el.removeAttribute('maxlength'); el.value = ''; }
+        }""",
+        [selector],
+    )
+    page.locator(selector).fill(value)
+
+
 def fetch_case_detail_data(
     case_number: str,
     court_name: str = "",
@@ -112,8 +124,8 @@ def fetch_case_detail_data(
                     parsed["year"],
                 )
 
-            case_no_field = page.locator("#mf_wfm_mainFrame_ibx_auctnCsSrchCsNo")
-            case_no_field.fill(parsed["type"] + parsed["num"])
+            _FIELD = "#mf_wfm_mainFrame_ibx_auctnCsSrchCsNo"
+            _fill_case_no(page, _FIELD, parsed["num"])
             time.sleep(0.3)
 
             page.locator("#mf_wfm_mainFrame_btn_auctnCsSrchBtn").click()
@@ -121,8 +133,8 @@ def fetch_case_detail_data(
 
             result_count = _get_result_count(page)
             if result_count == 0:
-                # 숫자만으로 재시도
-                case_no_field.fill(parsed["num"])
+                # 타입 포함 재시도
+                _fill_case_no(page, _FIELD, parsed["type"] + parsed["num"])
                 time.sleep(0.3)
                 page.locator("#mf_wfm_mainFrame_btn_auctnCsSrchBtn").click()
                 time.sleep(3)
@@ -369,22 +381,19 @@ def fetch_case_detail_screenshot(
                     parsed["year"],
                 )
 
-            # 5) 사건번호 입력 (사이트는 "타경1345" 또는 숫자만 허용)
-            case_no_field = page.locator("#mf_wfm_mainFrame_ibx_auctnCsSrchCsNo")
-            case_no_field.fill("")
-            time.sleep(0.3)
-            # 먼저 "타경1345" 전체 시도
-            case_no_field.fill(parsed["type"] + parsed["num"])
+            # 5) 사건번호 입력 (maxlength 우회 후 숫자 입력)
+            _FIELD = "#mf_wfm_mainFrame_ibx_auctnCsSrchCsNo"
+            _fill_case_no(page, _FIELD, parsed["num"])
             time.sleep(0.3)
 
             # 6) 검색 버튼 클릭
             page.locator("#mf_wfm_mainFrame_btn_auctnCsSrchBtn").click()
             time.sleep(3)
 
-            # 7) 결과 확인 — 결과가 없으면 숫자만으로 재시도
+            # 7) 결과 확인 — 결과가 없으면 타입 포함 재시도
             result_count = _get_result_count(page)
             if result_count == 0:
-                case_no_field.fill(parsed["num"])
+                _fill_case_no(page, _FIELD, parsed["type"] + parsed["num"])
                 time.sleep(0.3)
                 page.locator("#mf_wfm_mainFrame_btn_auctnCsSrchBtn").click()
                 time.sleep(3)

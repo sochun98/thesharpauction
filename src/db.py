@@ -345,21 +345,22 @@ def get_collected_count(engine: Engine, sigungu: str, year: int) -> int:
         return conn.execute(text(sql), params).scalar() or 0
 
 
-def load_ungeocode_records(engine: Engine, sido: str = "", sigungu: str = "", limit: int = 500) -> list[dict]:
+def load_ungeocode_records(engine: Engine, sido: str = "", sigungu: str = "", limit: int | None = None) -> list[dict]:
     """좌표 없는 레코드 조회 (지오코딩 보완용)."""
     where = ["lat IS NULL", "address IS NOT NULL", "address != ''"]
-    params: dict = {"limit": limit}
+    params: dict = {}
     if sido:
         where.append("sido = :sido")
         params["sido"] = sido
     if sigungu:
         where.append("sigungu = :sigungu")
         params["sigungu"] = sigungu
+    limit_clause = f"LIMIT {int(limit)}" if limit is not None else ""
     sql = f"""
         SELECT case_no, item_no, sido, sigungu, dong, lot_no, address
         FROM auction_cases
         WHERE {' AND '.join(where)}
-        LIMIT :limit
+        {limit_clause}
     """
     with engine.connect() as conn:
         rows = conn.execute(text(sql), params).mappings().all()

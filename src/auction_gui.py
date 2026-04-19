@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QSplitter, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QAbstractItemView,
     QCheckBox, QSpinBox, QDoubleSpinBox, QSizePolicy,
-    QStatusBar,
+    QStatusBar, QDialog, QDialogButtonBox,
 )
 
 # ── 경로 설정 ──────────────────────────────────────────────────────────────────
@@ -117,14 +117,79 @@ class GeocodeThread(QThread):
 
     @staticmethod
     def _clean_address(addr: str) -> str:
-        """
-        '사용본거지 : 경기도 ...' / '소재지 : 서울 ...' 처럼
-        법원 DB에서 붙는 한글 레이블 접두어를 제거한 뒤 실제 주소만 반환.
-        """
+        """'사용본거지 : 경기도 ...' 같은 한글 레이블 접두어 제거."""
         import re
-        # 패턴: 한글·공백으로 구성된 레이블 + ' :' 또는 ':' 다음의 내용이 주소
         cleaned = re.sub(r'^[가-힣\s]{1,15}\s*:\s*', '', addr).strip()
         return cleaned if cleaned else addr
+
+    @staticmethod
+    def _address_candidates(addr: str) -> list[str]:
+        """
+        지오코딩 fallback용 주소 후보 목록 (단순화 단계별).
+
+        단계:
+          0) 공백 정규화 + 원본
+          1) 괄호 내용 제거
+          2) 층·호·동 제거 (공백 포함 패턴, 제X층 제X호, 가나비동 포함)
+          3) 쉼표 이후 제거
+          4) 사업구역명 토큰 제거 (블록/블럭/로트/롯트/지구/생활권)
+          5) 중복 행정동명 제거
+        """
+        import re
+
+        seen: set[str] = set()
+        result: list[str] = []
+
+        def push(s: str) -> str:
+            s = re.sub(r'\s+', ' ', s).strip()   # 이중 공백 정규화
+            if s and s not in seen:
+                seen.add(s)
+                result.append(s)
+            return s
+
+        def strip_floor(s: str) -> str:
+            """층·호·동 정보를 제거. 여러 패턴 순차 적용."""
+            # 제X층 제X호
+            s = re.sub(r'\s+제\d+[층F]\s+제\d+호', '', s)
+            # [가-하]동 X층X호  (가동/나동/비동 등 한글 동이름)
+            s = re.sub(r'\s+[가-하]동\s+(?:지하)?\d+[층F].*$', '', s)
+            # X동 X층X호 / 지하X층X호 / X층X호 — 층 이후 끝까지 제거
+            s = re.sub(r'\s+(?:\d+동\s+)?(?:지하)?\d+[층F].*$', '', s)
+            return s
+
+        def strip_zone(s: str) -> str:
+            """사업구역명 토큰 제거 (블록/블럭/로트/롯트/생활권/지구 포함 어절)."""
+            return re.sub(
+                r'\S*(?:블럭|블록|로트|롯트|생활권|사업지구|개발구역|토지구획)\S*',
+                '', s
+            )
+
+        # 0) 공백 정규화 원본
+        s0 = push(addr)
+
+        # 1) 괄호 제거
+        s1 = push(re.sub(r'\s*\(.*?\)', '', s0))
+        base = s1 or s0
+
+        # 2) 층·호·동 제거
+        s2 = push(strip_floor(base))
+        base2 = s2 or base
+
+        # 3) 쉼표 이후 제거
+        s3 = push(re.sub(r',.*$', '', base2))
+        base3 = s3 or base2
+
+        # 4) 사업구역명 토큰 제거
+        s4 = push(strip_zone(base3))
+        base4 = s4 or base3
+
+        # 층·호가 남아 있을 경우 한번 더 제거
+        push(strip_floor(base4))
+
+        # 5) 중복 행정동명 제거
+        push(re.sub(r'\b([가-힣]+[동읍면리])\s+\1\b', r'\1', addr))
+
+        return result
 
     def run(self):
         ok, fail = 0, 0
@@ -133,18 +198,139 @@ class GeocodeThread(QThread):
             if not raw_addr:
                 continue
             addr = self._clean_address(raw_addr)
-            try:
-                loc = geocode(addr, self.naver_id, self.naver_secret)
+            candidates = self._address_candidates(addr)
+
+            loc = None
+            for candidate in candidates:
+                try:
+                    loc = geocode(candidate, self.naver_id, self.naver_secret)
+                    if candidate != addr:
+                        _logger.debug("지오코딩 fallback 성공 [%s] → [%s]", addr, candidate)
+                    break
+                except Exception:
+                    continue
+
+            if loc:
                 update_geocode(self.engine, row["case_no"], row["item_no"],
                                loc["lat"], loc["lng"])
                 ok += 1
-                time.sleep(0.05)
-            except Exception as e:
-                _logger.warning("지오코딩 실패 [%s]: %s", addr, e)
+            else:
+                _logger.warning("지오코딩 실패 [%s]: 모든 후보 주소 실패", addr)
                 fail += 1
+
+            time.sleep(0.05)
             if (i + 1) % 10 == 0:
                 self.log_signal.emit(f"  지오코딩 {i+1}/{len(self.records)}건 (성공 {ok}, 실패 {fail})")
         self.done_signal.emit(ok, fail)
+
+
+class MapLoadThread(QThread):
+    """DB 조회 + folium 렌더링 + HTML 저장을 백그라운드에서 수행."""
+    done_signal  = Signal(str, list)   # (html_path, rows)
+    error_signal = Signal(str)
+
+    def __init__(self, engine, sido, sigungu, year, usage_code):
+        super().__init__()
+        self.engine     = engine
+        self.sido       = sido
+        self.sigungu    = sigungu
+        self.year       = year
+        self.usage_code = usage_code
+
+    def run(self):
+        try:
+            rows = load_map_data(
+                self.engine,
+                sido=self.sido, sigungu=self.sigungu,
+                year=self.year, usage_code=self.usage_code,
+                only_geocoded=True,
+            )
+            if not rows:
+                self.done_signal.emit("", [])
+                return
+
+            html_path = self._build_html(rows)
+            self.done_signal.emit(html_path, rows)
+        except Exception as e:
+            self.error_signal.emit(f"{e}\n\n{__import__('traceback').format_exc()}")
+
+    def _build_html(self, rows: list[dict]) -> str:
+        center_lat = sum(r["lat"] for r in rows) / len(rows)
+        center_lng = sum(r["lng"] for r in rows) / len(rows)
+
+        m = folium.Map(location=[center_lat, center_lng], zoom_start=13, tiles="CartoDB positron")
+
+        STATUS_COLOR = {
+            "진행중": "red", "낙찰": "blue", "재매각": "orange",
+            "취하": "gray", "취소": "gray",
+        }
+        for idx, row in enumerate(rows):
+            color = STATUS_COLOR.get(row.get("status", ""), "purple")
+            appr  = row.get("appraisal") or 0
+            mb    = row.get("min_bid")   or 0
+            ratio = f"{mb/appr*100:.0f}%" if appr > 0 else "-"
+            addr  = row.get("address", "") or ""
+            popup_html = (
+                f"<a href='auction-select://row/{idx}' "
+                f"style='font-size:13px;font-weight:bold;color:#1a237e;"
+                f"text-decoration:none;' title='목록에서 이 사건 선택'>"
+                f"{row['case_no']}</a>"
+                f" <span style='color:#555;font-size:11px;'>({row.get('item_no',1)}번)</span><br>"
+                f"<small>{row.get('usage','')}</small><br>"
+                f"<hr style='margin:3px 0'>"
+                f"📍 {addr or (row.get('sigungu','') + ' ' + row.get('dong',''))}<br>"
+                f"💰 감정가: {appr:,}원<br>"
+                f"🔖 최저가: {mb:,}원 ({ratio})<br>"
+                f"📅 {row.get('auction_date','-')} | 유찰 {row.get('fail_count',0)}회<br>"
+                f"<b>{row.get('status','-')}</b><br>"
+                f"<hr style='margin:4px 0'>"
+                f"<a href='auction-case://row/{idx}' "
+                f"style='color:#1565c0;font-weight:bold;text-decoration:underline;'>"
+                f"⚖️ 법원경매 상세보기</a>"
+            )
+            folium.CircleMarker(
+                location=[row["lat"], row["lng"]],
+                radius=7, color=color, fill=True, fill_opacity=0.75,
+                popup=folium.Popup(popup_html, max_width=260),
+                tooltip=f"{row['case_no']} ({row.get('status','')})",
+            ).add_to(m)
+
+        legend = """
+        <div style='position:fixed;bottom:20px;left:20px;z-index:9999;
+             background:white;padding:8px 12px;border-radius:6px;
+             border:1px solid #ccc;font-size:12px;line-height:1.8'>
+        🔴 진행중 &nbsp; 🔵 낙찰 &nbsp; 🟠 재매각 &nbsp; ⚫ 취하/취소 &nbsp; 🟣 기타
+        </div>"""
+        m.get_root().html.add_child(folium.Element(legend))
+
+        map_var = m.get_name()
+        tmp = tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8")
+        m.save(tmp.name)
+        tmp.close()
+
+        with open(tmp.name, "r", encoding="utf-8") as f:
+            html_content = f.read()
+
+        bridge = (
+            "<script>"
+            "document.addEventListener('DOMContentLoaded', function() {"
+            f"  window._auction_map = {map_var};"
+            "  window._highlight_circle = L.circleMarker([0, 0], {"
+            "    radius: 18,"
+            "    color: '#FFD700',"
+            "    weight: 4,"
+            "    fillColor: '#FF4500',"
+            "    fillOpacity: 0.55,"
+            "    opacity: 0"
+            "  }).addTo(window._auction_map);"
+            "});"
+            "</script>"
+        )
+        html_content = html_content.replace("</body>", bridge + "\n</body>")
+        with open(tmp.name, "w", encoding="utf-8") as f:
+            f.write(html_content)
+
+        return tmp.name
 
 
 class OpenBrowserThread(QThread):
@@ -152,7 +338,8 @@ class OpenBrowserThread(QThread):
     Playwright 비헤드리스 브라우저를 열고 법원경매 사건 상세 페이지로 이동합니다.
     사용자가 브라우저를 직접 닫을 때까지 스레드가 살아있어 브라우저가 유지됩니다.
     """
-    ready_signal = Signal()   # 페이지 이동 완료 (브라우저는 아직 열려 있음)
+    ready_signal = Signal()
+    text_signal  = Signal(str)   # 상세 페이지 전체 텍스트
     error_signal = Signal(str)
 
     def __init__(self, case_no: str, court: str):
@@ -165,7 +352,7 @@ class OpenBrowserThread(QThread):
         from detail_scraper import (
             parse_case_number, BASE_URL, SEARCH_URL,
             _wait_websquare, _select_court, _select_option_by_value,
-            _get_result_count, _click_first_result,
+            _get_result_count, _click_first_result, _fill_case_no,
         )
         parsed = parse_case_number(self.case_no)
         try:
@@ -196,19 +383,44 @@ class OpenBrowserThread(QThread):
                         "#mf_wfm_mainFrame_sbx_auctnCsSrchCsYear",
                         parsed["year"],
                     )
-                case_no_field = page.locator("#mf_wfm_mainFrame_ibx_auctnCsSrchCsNo")
-                case_no_field.fill(parsed["type"] + parsed["num"])
-                time.sleep(0.3)
-                page.locator("#mf_wfm_mainFrame_btn_auctnCsSrchBtn").click()
-                time.sleep(3)
-                result_count = _get_result_count(page)
-                if result_count == 0:
-                    case_no_field.fill(parsed["num"])
+                _FIELD = "#mf_wfm_mainFrame_ibx_auctnCsSrchCsNo"
+
+                def _browser_closed(e: Exception) -> bool:
+                    msg = str(e)
+                    return "Target page" in msg or "browser has been closed" in msg or "Browser closed" in msg
+
+                # ── 1단계: 사건 검색 → 상세 페이지 이동 ──────────────────────
+                try:
+                    _fill_case_no(page, _FIELD, parsed["num"])
                     time.sleep(0.3)
                     page.locator("#mf_wfm_mainFrame_btn_auctnCsSrchBtn").click()
                     time.sleep(3)
-                _click_first_result(page)
-                time.sleep(3)
+                    result_count = _get_result_count(page)
+                    if result_count == 0:
+                        _fill_case_no(page, _FIELD, parsed["type"] + parsed["num"])
+                        time.sleep(0.3)
+                        page.locator("#mf_wfm_mainFrame_btn_auctnCsSrchBtn").click()
+                        time.sleep(3)
+                    _click_first_result(page)
+                    time.sleep(3)
+                except Exception as nav_err:
+                    if _browser_closed(nav_err):
+                        _logger.info("브라우저 닫혀 탐색 중단")
+                        return
+                    raise
+
+                # ── 2단계: 텍스트 추출 (실패해도 ready_signal은 emit) ─────────
+                import re as _re
+                try:
+                    raw = page.evaluate(
+                        "document.querySelector('[id*=\"mainFrame\"]')"
+                        "?.innerText || document.body.innerText"
+                    ) or ""
+                    text = _re.sub(r'\n{3,}', '\n\n', raw).strip()
+                    if text:
+                        self.text_signal.emit(text)
+                except Exception as txt_err:
+                    _logger.warning("텍스트 추출 실패: %s", txt_err)
 
                 self.ready_signal.emit()
 
@@ -229,19 +441,26 @@ class OpenBrowserThread(QThread):
 class MapPage(QWebEnginePage):
     """
     Folium 지도 HTML 안의 마커 팝업 링크 클릭을 가로채는 커스텀 페이지.
-    팝업에 삽입된 <a href="auction-case://row/숫자"> 링크가 클릭되면
-    row_requested 시그널(행 인덱스)을 발생시키고 실제 내비게이션은 막습니다.
+
+    커스텀 URL 스킴:
+      auction-case://row/{idx}   → 법원경매 사이트 브라우저 열기
+      auction-select://row/{idx} → 하단 테이블에서 해당 행 선택
     """
-    row_requested = Signal(int)
+    row_requested       = Signal(int)   # 브라우저 열기
+    row_select_requested = Signal(int)  # 테이블 행 선택
 
     def acceptNavigationRequest(self, url, nav_type, is_main_frame):
-        if url.scheme() == "auction-case":
-            # 경로 예: /row/0
+        scheme = url.scheme()
+        if scheme in ("auction-case", "auction-select"):
             parts = url.path().strip("/").split("/")
             try:
-                self.row_requested.emit(int(parts[-1]))
+                idx = int(parts[-1])
             except (ValueError, IndexError):
-                pass
+                return False
+            if scheme == "auction-case":
+                self.row_requested.emit(idx)
+            else:
+                self.row_select_requested.emit(idx)
             return False   # 내비게이션 차단 → 지도 유지
         return super().acceptNavigationRequest(url, nav_type, is_main_frame)
 
@@ -260,6 +479,7 @@ class AuctionMainWindow(QMainWindow):
         self.engine = None
         self._map_rows: list[dict] = []
         self._map_html_path = ""
+        self._folium_map_var = ""
 
         self._build_ui()
         self._connect_signals()
@@ -423,6 +643,22 @@ class AuctionMainWindow(QMainWindow):
         fl.addWidget(self.btn_geocode,  2, 3, 1, 3)
         layout.addWidget(filter_box)
 
+        # ── 사건번호 검색 바 (splitter 밖 — QWebEngineView 덮임 방지) ────────────
+        search_bar = QWidget()
+        search_bar.setFixedHeight(36)
+        search_row = QHBoxLayout(search_bar)
+        search_row.setContentsMargins(0, 2, 0, 2)
+        search_row.addWidget(QLabel("사건번호 검색:"))
+        self.map_search_edit = QLineEdit()
+        self.map_search_edit.setPlaceholderText("예) 2025타경1345  (Enter 또는 버튼 클릭)")
+        self.map_search_edit.setFixedHeight(28)
+        search_row.addWidget(self.map_search_edit)
+        self.btn_case_search = QPushButton("🔎 검색")
+        self.btn_case_search.setFixedHeight(28)
+        self.btn_case_search.setFixedWidth(80)
+        search_row.addWidget(self.btn_case_search)
+        layout.addWidget(search_bar)
+
         # ── 지도 + 테이블 분할 ─────────────────────────────────────────────
         splitter = QSplitter(Qt.Orientation.Vertical)
 
@@ -434,7 +670,7 @@ class AuctionMainWindow(QMainWindow):
         s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
         self.web_view = QWebEngineView()
         self.web_view.setPage(self.map_page)
-        self.web_view.setMinimumHeight(320)
+        self.web_view.setMinimumHeight(300)
         splitter.addWidget(self.web_view)
 
         # 테이블
@@ -442,9 +678,9 @@ class AuctionMainWindow(QMainWindow):
         table_lay = QVBoxLayout(table_w)
         table_lay.setContentsMargins(0, 0, 0, 0)
 
-        self.map_table = QTableWidget(0, 9)
+        self.map_table = QTableWidget(0, 10)
         self.map_table.setHorizontalHeaderLabels([
-            "사건번호", "물건번호", "시군구", "동", "용도",
+            "사건번호", "물건번호", "시군구", "동", "주소", "용도",
             "감정가(원)", "유찰", "매각기일", "상태",
         ])
         self.map_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
@@ -452,7 +688,7 @@ class AuctionMainWindow(QMainWindow):
         self.map_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.map_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.map_table.setAlternatingRowColors(True)
-        self.map_table.setMinimumHeight(180)
+        self.map_table.setMinimumHeight(160)
         table_lay.addWidget(self.map_table)
 
         # 상세보기 영역 (지도 마커 클릭 또는 버튼으로 브라우저 열기)
@@ -468,7 +704,7 @@ class AuctionMainWindow(QMainWindow):
         table_lay.addLayout(detail_row)
 
         splitter.addWidget(table_w)
-        splitter.setSizes([400, 260])
+        splitter.setSizes([380, 240])
         layout.addWidget(splitter)
 
         # 지도 로그
@@ -489,8 +725,12 @@ class AuctionMainWindow(QMainWindow):
         self.btn_load_map.clicked.connect(self._on_load_map)
         self.btn_geocode.clicked.connect(self._on_geocode)
         self.map_table.itemSelectionChanged.connect(self._on_table_select)
+        self.map_table.cellClicked.connect(self._on_table_row_clicked)
         self.btn_detail.clicked.connect(self._on_detail)
         self.map_page.row_requested.connect(self._on_map_row_click)
+        self.map_page.row_select_requested.connect(self._on_map_marker_select)
+        self.btn_case_search.clicked.connect(self._on_search_case)
+        self.map_search_edit.returnPressed.connect(self._on_search_case)
 
         # 초기 시군구 목록 로드
         self._on_sido_changed(self.sido_combo.currentText())
@@ -653,20 +893,23 @@ class AuctionMainWindow(QMainWindow):
         }
         f_util = util_map.get(self.map_util.currentText(), "")
 
-        self.status_bar.showMessage("DB 조회 중...")
-        QApplication.processEvents()
-
-        rows = load_map_data(
-            self.engine,
-            sido=f_sido, sigungu=f_sgu, year=f_year,
-            usage_code=f_util, only_geocoded=True,
-        )
-        self._map_rows = rows
+        self.btn_load_map.setEnabled(False)
+        self.btn_load_map.setText("지도 생성 중...")
+        self.status_bar.showMessage("DB 조회 및 지도 생성 중... (잠시 기다려 주세요)")
+        self.map_log.setText("지도 데이터 로딩 중...")
 
         ungeo = get_ungeocode_count(self.engine, f_sido, f_sgu)
-        self.map_log.setText(
-            f"지도 표시: {len(rows):,}건 (좌표 있음) | 좌표 없는 건: {ungeo:,}건"
+
+        self._map_thread = MapLoadThread(self.engine, f_sido, f_sgu, f_year, f_util)
+        self._map_thread.done_signal.connect(
+            lambda path, rows, u=ungeo: self._on_map_loaded(path, rows, u)
         )
+        self._map_thread.error_signal.connect(self._on_map_load_error)
+        self._map_thread.start()
+
+    def _on_map_loaded(self, html_path: str, rows: list[dict], ungeo: int):
+        self.btn_load_map.setEnabled(True)
+        self.btn_load_map.setText("🔍  지도 조회")
 
         if not rows:
             self.web_view.setHtml(
@@ -674,63 +917,25 @@ class AuctionMainWindow(QMainWindow):
                 "조회된 데이터가 없습니다.<br>수집 후 [좌표 보완]을 먼저 실행하세요.</h3>"
             )
             self.map_table.setRowCount(0)
+            self.map_log.setText("데이터 없음")
             self.status_bar.showMessage("데이터 없음")
             return
 
-        self._render_map(rows)
+        self._map_rows = rows
+        self._map_html_path = html_path
+        self.web_view.load(QUrl.fromLocalFile(html_path))
         self._fill_table(rows)
+        self.map_log.setText(
+            f"지도 표시: {len(rows):,}건 (좌표 있음) | 좌표 없는 건: {ungeo:,}건"
+        )
         self.status_bar.showMessage(f"지도 표시: {len(rows):,}건")
 
-    def _render_map(self, rows: list[dict]):
-        center_lat = sum(r["lat"] for r in rows) / len(rows)
-        center_lng = sum(r["lng"] for r in rows) / len(rows)
-
-        m = folium.Map(location=[center_lat, center_lng], zoom_start=13, tiles="CartoDB positron")
-
-        STATUS_COLOR = {
-            "진행중": "red", "낙찰": "blue", "재매각": "orange",
-            "취하": "gray", "취소": "gray",
-        }
-        for idx, row in enumerate(rows):
-            color = STATUS_COLOR.get(row.get("status", ""), "purple")
-            appr  = row.get("appraisal") or 0
-            mb    = row.get("min_bid")   or 0
-            ratio = f"{mb/appr*100:.0f}%" if appr > 0 else "-"
-            popup_html = (
-                f"<b>{row['case_no']}</b> ({row.get('item_no',1)}번)<br>"
-                f"<small>{row.get('usage','')}</small><br>"
-                f"<hr style='margin:3px 0'>"
-                f"📍 {row.get('sigungu','')} {row.get('dong','')}<br>"
-                f"💰 감정가: {appr:,}원<br>"
-                f"🔖 최저가: {mb:,}원 ({ratio})<br>"
-                f"📅 {row.get('auction_date','-')} | 유찰 {row.get('fail_count',0)}회<br>"
-                f"<b>{row.get('status','-')}</b><br>"
-                f"<hr style='margin:4px 0'>"
-                f"<a href='auction-case://row/{idx}' "
-                f"style='color:#1565c0;font-weight:bold;text-decoration:underline;'>"
-                f"⚖️ 법원경매 상세보기</a>"
-            )
-            folium.CircleMarker(
-                location=[row["lat"], row["lng"]],
-                radius=7, color=color, fill=True, fill_opacity=0.75,
-                popup=folium.Popup(popup_html, max_width=260),
-                tooltip=f"{row['case_no']} ({row.get('status','')})",
-            ).add_to(m)
-
-        # 범례
-        legend = """
-        <div style='position:fixed;bottom:20px;left:20px;z-index:9999;
-             background:white;padding:8px 12px;border-radius:6px;
-             border:1px solid #ccc;font-size:12px;line-height:1.8'>
-        🔴 진행중 &nbsp; 🔵 낙찰 &nbsp; 🟠 재매각 &nbsp; ⚫ 취하/취소 &nbsp; 🟣 기타
-        </div>"""
-        m.get_root().html.add_child(folium.Element(legend))
-
-        tmp = tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8")
-        m.save(tmp.name)
-        tmp.close()
-        self._map_html_path = tmp.name
-        self.web_view.load(QUrl.fromLocalFile(tmp.name))
+    def _on_map_load_error(self, msg: str):
+        self.btn_load_map.setEnabled(True)
+        self.btn_load_map.setText("🔍  지도 조회")
+        self.status_bar.showMessage("지도 로드 실패")
+        _logger.error("지도 로드 실패: %s", msg)
+        QMessageBox.critical(self, "지도 로드 실패", msg[:500])
 
     def _fill_table(self, rows: list[dict]):
         self.map_table.setRowCount(len(rows))
@@ -741,17 +946,22 @@ class AuctionMainWindow(QMainWindow):
                 str(row.get("item_no", 1)),
                 row.get("sigungu", ""),
                 row.get("dong", ""),
+                row.get("address", "") or "",   # 주소 (col 4)
                 row.get("usage", ""),
                 f"{appr:,}",
                 str(row.get("fail_count", 0)),
                 row.get("auction_date", ""),
-                row.get("status", ""),
+                row.get("status", ""),           # 상태 (col 9)
             ]
             for j, v in enumerate(vals):
                 item = QTableWidgetItem(v)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                # 상태 색상
-                if j == 8:
+                # 주소 컬럼은 왼쪽 정렬, 나머지는 가운데
+                if j == 4:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                else:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                # 상태 색상 (col 9)
+                if j == 9:
                     color_map = {
                         "진행중": QColor("#ffd6d6"),
                         "낙찰":   QColor("#d6eaff"),
@@ -764,6 +974,70 @@ class AuctionMainWindow(QMainWindow):
     def _on_table_select(self):
         sel = self.map_table.selectedItems()
         self.btn_detail.setEnabled(bool(sel))
+
+    def _on_table_row_clicked(self, row: int, col: int):
+        """테이블 행 단일 클릭 → 지도 해당 위치로 이동."""
+        self._pan_map_to(row)
+
+    def _on_map_marker_select(self, idx: int):
+        """팝업의 사건번호 클릭 → 테이블 해당 행 선택 + 스크롤."""
+        if not (0 <= idx < self.map_table.rowCount()):
+            return
+        self.map_table.clearSelection()
+        self.map_table.selectRow(idx)
+        item = self.map_table.item(idx, 0)
+        if item:
+            self.map_table.scrollToItem(
+                item, QAbstractItemView.ScrollHint.PositionAtCenter
+            )
+            self.status_bar.showMessage(
+                f"선택: {item.text()} — 목록에서 강조 표시됨"
+            )
+
+    def _on_search_case(self):
+        """사건번호 검색 → 테이블 행 선택 + 지도 이동."""
+        keyword = self.map_search_edit.text().strip()
+        if not keyword or not self._map_rows:
+            return
+
+        # 사건번호(0번 컬럼)에서 keyword를 포함하는 첫 행 탐색
+        for row in range(self.map_table.rowCount()):
+            item = self.map_table.item(row, 0)
+            if item and keyword in item.text():
+                self.map_table.clearSelection()
+                self.map_table.selectRow(row)
+                self.map_table.scrollToItem(
+                    item, QAbstractItemView.ScrollHint.PositionAtCenter
+                )
+                self._pan_map_to(row)
+                self.status_bar.showMessage(
+                    f"사건번호 '{keyword}' — {item.text()} (행 {row+1}번)"
+                )
+                return
+
+        self.status_bar.showMessage(f"사건번호 '{keyword}'을 찾을 수 없습니다.")
+
+    def _pan_map_to(self, row_idx: int):
+        """지도를 _map_rows[row_idx] 위치로 이동하고 강조 마커를 표시합니다."""
+        if not (0 <= row_idx < len(self._map_rows)):
+            return
+        row = self._map_rows[row_idx]
+        lat, lng = row.get("lat"), row.get("lng")
+        if lat is None or lng is None:
+            return
+        js = f"""
+(function() {{
+  var m = window._auction_map;
+  var h = window._highlight_circle;
+  if (!m) return;
+  m.setView([{lat}, {lng}], 17);
+  if (h) {{
+    h.setLatLng([{lat}, {lng}]);
+    h.setStyle({{opacity: 1, fillOpacity: 0.55}});
+  }}
+}})();
+"""
+        self.map_page.runJavaScript(js)
 
     # ── 좌표 보완 ─────────────────────────────────────────────────────────────
 
@@ -779,7 +1053,7 @@ class AuctionMainWindow(QMainWindow):
         f_sido = "" if self.map_sido.currentText() == "(전체)" else self.map_sido.currentText()
         f_sgu  = "" if self.map_sgu.currentText()  == "(전체)" else self.map_sgu.currentText()
 
-        records = load_ungeocode_records(self.engine, f_sido, f_sgu, limit=500)
+        records = load_ungeocode_records(self.engine, f_sido, f_sgu)
         if not records:
             QMessageBox.information(self, "완료", "좌표 없는 레코드가 없습니다.")
             return
@@ -829,6 +1103,9 @@ class AuctionMainWindow(QMainWindow):
 
         self._det_thread = OpenBrowserThread(case_no, court)
         self._det_thread.ready_signal.connect(self._on_browser_ready)
+        self._det_thread.text_signal.connect(
+            lambda t, cn=case_no: self._on_page_text_ready(t, cn)
+        )
         self._det_thread.error_signal.connect(self._on_detail_error)
         self._det_thread.start()
 
@@ -839,6 +1116,45 @@ class AuctionMainWindow(QMainWindow):
         self.status_bar.showMessage(
             "법원경매 사이트가 브라우저에서 열렸습니다 — 브라우저 창을 직접 닫으세요"
         )
+
+    def _on_page_text_ready(self, text: str, case_no: str):
+        """상세 페이지 전체 텍스트를 복사 가능한 다이얼로그로 표시."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"페이지 텍스트 — {case_no}")
+        dlg.resize(700, 600)
+
+        layout = QVBoxLayout(dlg)
+
+        edit = QTextEdit()
+        edit.setReadOnly(True)
+        edit.setPlainText(text)
+        edit.setFont(QFont("맑은 고딕", 9))
+        layout.addWidget(edit)
+
+        btn_row = QHBoxLayout()
+        btn_copy_all = QPushButton("📋 전체 복사")
+        btn_copy_all.setFixedHeight(32)
+        btn_copy_all.clicked.connect(lambda: (
+            QApplication.clipboard().setText(edit.toPlainText()),
+            self.status_bar.showMessage("클립보드에 복사됨"),
+        ))
+        btn_copy_sel = QPushButton("📋 선택 복사")
+        btn_copy_sel.setFixedHeight(32)
+        btn_copy_sel.clicked.connect(lambda: (
+            QApplication.clipboard().setText(edit.textCursor().selectedText()),
+            self.status_bar.showMessage("선택 내용 클립보드에 복사됨"),
+        ))
+        btn_close = QPushButton("닫기")
+        btn_close.setFixedHeight(32)
+        btn_close.clicked.connect(dlg.close)
+
+        btn_row.addWidget(btn_copy_all)
+        btn_row.addWidget(btn_copy_sel)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+        dlg.show()
 
     def _on_detail_error(self, msg: str):
         self.btn_detail.setEnabled(True)
